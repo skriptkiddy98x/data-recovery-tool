@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+
+# Recovery output / sandbox
+obnovene/
+obnovene_data/
+ObnovaSandbox_*/
+*.img
+
+# OS
+.DS_Store
+Thumbs.db
