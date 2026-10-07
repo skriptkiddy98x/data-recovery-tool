@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-obnova_meta.py — citanie datumu ZABUDOVANEHO vnutri suboru (nie datum zmazania,
-ten carving nevie). Funguje pre: JPEG (EXIF), PDF, ZIP/docx/xlsx, MP4.
-Pre ostatne typy vrati None (datum neznamy).
+recovery_meta.py — reads the date EMBEDDED inside a file (not the deletion date,
+which carving cannot know). Works for: JPEG (EXIF), PDF, ZIP/docx/xlsx, MP4.
+For other types it returns None (date unknown).
 """
 
-import os
 import re
 import struct
 import datetime
 
 
 def _exif_date(path):
-    """DateTimeOriginal / DateTime z JPEG EXIF -> datetime alebo None."""
+    """DateTimeOriginal / DateTime from JPEG EXIF -> datetime or None."""
     try:
         with open(path, "rb") as f:
-            data = f.read(256 * 1024)  # EXIF je na zaciatku suboru
+            data = f.read(256 * 1024)  # EXIF is near the start of the file
     except OSError:
         return None
-    # najdi APP1 segment s 'Exif\0\0'
     i = data.find(b"Exif\x00\x00")
     if i == -1:
         return None
@@ -53,13 +51,13 @@ def _exif_date(path):
                 tag = u16(e)
                 typ = u16(e + 2)
                 cnt = u32(e + 4)
-                if tag in (0x0132, 0x9003, 0x9004) and typ == 2:  # ASCII datumy
+                if tag in (0x0132, 0x9003, 0x9004) and typ == 2:  # ASCII dates
                     voff = e + 8
                     if cnt > 4:
                         voff = u32(e + 8)
                     s = tiff[voff:voff + cnt].split(b"\x00", 1)[0]
                     found[tag] = s.decode("ascii", "ignore")
-                elif tag == 0x8769:  # ukazovatel na Exif sub-IFD
+                elif tag == 0x8769:  # pointer to the Exif sub-IFD
                     exif_ptr = u32(e + 8)
             return exif_ptr
 
@@ -115,7 +113,7 @@ def _zip_date(path):
 
 
 def _mp4_date(path):
-    """creation_time z mvhd atomu (sekundy od 1904-01-01)."""
+    """creation_time from the mvhd atom (seconds since 1904-01-01)."""
     EPOCH_1904 = datetime.datetime(1904, 1, 1)
     try:
         with open(path, "rb") as f:
@@ -131,7 +129,7 @@ def _mp4_date(path):
             secs = struct.unpack(">I", data[i + 8:i + 12])[0]
         else:
             secs = struct.unpack(">Q", data[i + 8:i + 16])[0]
-        if 0 < secs < 20 * 365 * 24 * 3600 * 10:  # rozumny rozsah
+        if 0 < secs < 20 * 365 * 24 * 3600 * 10:  # sane range
             return EPOCH_1904 + datetime.timedelta(seconds=secs)
     except (struct.error, IndexError):
         return None
@@ -148,7 +146,7 @@ _READERS = {
 
 
 def extract_date(path, ext):
-    """Vrati datetime zabudovany v subore, alebo None ak sa neda zistit."""
+    """Return the datetime embedded in the file, or None if it can't be read."""
     reader = _READERS.get(ext.lower())
     if not reader:
         return None
@@ -158,25 +156,25 @@ def extract_date(path, ext):
         return None
 
 
-# mapovanie: kategoria pre pouzivatela -> ktore pripony
+# mapping: user-facing category -> which extensions
 CATEGORIES = {
-    "fotky": ["jpg", "png", "gif"],
-    "videa": ["mp4"],
-    "dokumenty": ["pdf", "zip", "doc"],
-    "archivy": ["zip", "rar", "7z", "gz"],
-    "hudba": ["mp3", "wav"],
+    "photos": ["jpg", "png", "gif"],
+    "videos": ["mp4"],
+    "documents": ["pdf", "zip", "doc"],
+    "archives": ["zip", "rar", "7z", "gz"],
+    "music": ["mp3", "wav"],
     "exe": ["exe"],
-    "databazy": ["sqlite"],
+    "databases": ["sqlite"],
 }
 
 CATEGORY_LABELS = {
-    "fotky": "🖼  Fotky (JPG, PNG, GIF)",
-    "videa": "🎬  Videá (MP4)",
-    "dokumenty": "📄  Dokumenty (PDF, Word, Excel)",
-    "archivy": "🗜  Archívy (ZIP, RAR, 7z)",
-    "hudba": "🎵  Hudba (MP3, WAV)",
-    "exe": "⚙  Spustiteľné (EXE)",
-    "databazy": "🗃  Databázy (SQLite)",
+    "photos": "🖼  Photos (JPG, PNG, GIF)",
+    "videos": "🎬  Videos (MP4)",
+    "documents": "📄  Documents (PDF, Word, Excel)",
+    "archives": "🗜  Archives (ZIP, RAR, 7z)",
+    "music": "🎵  Music (MP3, WAV)",
+    "exe": "⚙  Executables (EXE)",
+    "databases": "🗃  Databases (SQLite)",
 }
 
 

@@ -1,4 +1,4 @@
-# ObnovaDat — Deleted File Recovery Tool
+# Data Recovery Tool
 
 A cross-platform (Windows / Linux) tool that recovers deleted files from a hard
 disk, SSD, USB stick, memory card, or a disk image. It ships with a simple
@@ -6,6 +6,8 @@ desktop app, an advanced desktop app, and a command-line interface.
 
 The source drive is **only ever read, never written to**, so scanning a device
 cannot damage or overwrite the data you are trying to recover.
+
+![Advanced app — scan results with date filter and in-app preview](docs/screenshot.png)
 
 ---
 
@@ -16,7 +18,7 @@ operating system just marks that space as "free". Until something new is written
 over it, the original bytes are still physically on the disk and can be brought
 back.
 
-ObnovaDat finds those files using **file carving**: it reads the raw device byte
+This tool finds those files using **file carving**: it reads the raw device byte
 by byte and looks for the known "signatures" of files (the fixed header and
 footer bytes that identify a JPEG, PNG, PDF, ZIP, MP4, and so on). When it finds
 a valid start and end, it extracts the file. Because this works on the raw
@@ -58,13 +60,12 @@ executables (`EXE`/PE).
 
 | File | Purpose |
 |------|---------|
-| `obnova_dat.py` | Core carving engine + command-line interface |
-| `obnova_meta.py` | Reads embedded dates (EXIF / PDF / ZIP / MP4) and file categories |
-| `Obnova dat PRO.pyw` | Advanced desktop app (type + date filter, in-app preview, selective restore) |
-| `Obnova dat.pyw` | Simple desktop app (pick a source, scan, done) |
-| `Spustit PRO (Windows).bat` | Launcher for the advanced app on Windows |
-| `Spustit obnovu (Windows).bat` | Launcher for the simple app on Windows |
-| `NAVOD.md` | User guide (Slovak) |
+| `recovery_core.py` | Core carving engine + command-line interface |
+| `recovery_meta.py` | Reads embedded dates (EXIF / PDF / ZIP / MP4) and file categories |
+| `RecoveryTool PRO.pyw` | Advanced desktop app (type + date filter, in-app preview, selective restore) |
+| `RecoveryTool.pyw` | Simple desktop app (pick a source, scan, done) |
+| `Run PRO (Windows).bat` | Launcher for the advanced app on Windows |
+| `Run (Windows).bat` | Launcher for the simple app on Windows |
 
 ---
 
@@ -79,9 +80,8 @@ executables (`EXE`/PE).
 
 ### Desktop app (recommended)
 
-**Windows:** double-click **`Obnova dat PRO.pyw`** (or
-`Spustit PRO (Windows).bat`). Approve the UAC prompt (needed to read the disk),
-then:
+**Windows:** double-click **`RecoveryTool PRO.pyw`** (or `Run PRO (Windows).bat`).
+Approve the UAC prompt (needed to read the disk), then:
 
 1. Pick the **disk / USB** (or an image file).
 2. Tick the **file types** to look for (Photos, Videos, Documents, Archives,
@@ -96,29 +96,29 @@ then:
 **Linux:**
 
 ```bash
-sudo python3 "Obnova dat PRO.pyw"
+sudo python3 "RecoveryTool PRO.pyw"
 ```
 
 ### Command line
 
 ```bash
 # list available disks/partitions
-python obnova_dat.py --list
+python recovery_core.py --list
 
 # Windows: recover from a USB partition to another drive (run as Administrator)
-python obnova_dat.py \\.\E: -o D:\recovered
+python recovery_core.py \\.\E: -o D:\recovered
 
 # Windows: recover from a whole physical disk
-python obnova_dat.py \\.\PhysicalDrive1 -o D:\recovered
+python recovery_core.py \\.\PhysicalDrive1 -o D:\recovered
 
 # Linux: recover from a device (run with sudo)
-sudo python3 obnova_dat.py /dev/sdb -o ~/recovered
+sudo python3 recovery_core.py /dev/sdb -o ~/recovered
 
 # recover from a disk image, enable extended types
-python obnova_dat.py disk.img -o recovered --all
+python recovery_core.py disk.img -o recovered --all
 
 # only specific extensions
-python obnova_dat.py disk.img -o recovered --only jpg,png,pdf
+python recovery_core.py disk.img -o recovered --only jpg,png,pdf
 ```
 
 | Flag | Meaning |
@@ -130,7 +130,7 @@ python obnova_dat.py disk.img -o recovered --only jpg,png,pdf
 | `--max-open N` | max simultaneously open carves (default 300) |
 | `-q` | quiet (no progress output) |
 
-Recovered files are written as `obnovene_000001.jpg`, `obnovene_000002.png`, …
+Recovered files are written as `recovered_000001.jpg`, `recovered_000002.png`, …
 
 ---
 
@@ -153,7 +153,7 @@ Recovered files are written as `obnovene_000001.jpg`, `obnovene_000002.png`, …
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --noconsole --name "ObnovaDat" "Obnova dat PRO.pyw"
+pyinstaller --onefile --noconsole --name "RecoveryTool" "RecoveryTool PRO.pyw"
 ```
 
 ## License

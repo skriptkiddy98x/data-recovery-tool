@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-obnova_dat.py — nastroj na obnovu vymazanych suborov (file carving).
+recovery_core.py — deleted-file recovery engine (file carving) + CLI.
 
-Funguje na Windows aj Linux, cita disk / USB / oddiel / image bajt po bajte
-a podla znamych signatur (hlavicka + pripadne paticka) vyreze subory, ktore
-este neboli prepisane. ZDROJ CITA LEN NA CITANIE — nikdy nan nezapisuje.
+Works on Windows and Linux. Reads a disk / USB / partition / image byte by
+byte and, using known signatures (header + optional footer), extracts files
+that have not been overwritten yet. The SOURCE IS READ-ONLY — it is never
+written to.
 
-Pouzitie (priklady):
-  # vypis dostupnych diskov
-  python obnova_dat.py --list
+Examples:
+  # list available disks
+  python recovery_core.py --list
 
-  # obnova z USB na Linuxe (treba root), vysledok do priecinka obnovene
-  sudo python3 obnova_dat.py /dev/sdb -o obnovene
+  # recover from a USB on Linux (needs root), output to ./recovered
+  sudo python3 recovery_core.py /dev/sdb -o recovered
 
-  # obnova z fyzickeho disku na Windows (treba spustit ako Administrator)
-  python obnova_dat.py \\.\PhysicalDrive1 -o D:\obnovene
+  # recover from a physical disk on Windows (run as Administrator)
+  python recovery_core.py \\.\PhysicalDrive1 -o D:\recovered
 
-  # obnova z oddielu E: na Windows
-  python obnova_dat.py \\.\E: -o D:\obnovene
+  # recover from the E: partition on Windows
+  python recovery_core.py \\.\E: -o D:\recovered
 
-  # obnova z image suboru vytvoreneho cez dd
-  python obnova_dat.py disk.img -o obnovene --all
+  # recover from a disk image created with dd
+  python recovery_core.py disk.img -o recovered --all
 
-DOLEZITE:
-  * Vystupny priecinok (-o) musi byt na INOM disku nez zdroj, inak zapis
-    noveho suboru moze prepisat prave to, co chces obnovit.
-  * Citanie surovych diskov vyzaduje administratorske / root opravnenia.
+IMPORTANT:
+  * The output directory (-o) must be on a DIFFERENT drive than the source,
+    otherwise writing a recovered file may overwrite what you are recovering.
+  * Reading raw devices requires administrator / root privileges.
 """
 
 import argparse
@@ -35,18 +36,18 @@ import sys
 import platform
 import subprocess
 
-# --- definicia typov suborov -------------------------------------------------
-# header        : bajty na zaciatku suboru
-# footer        : bajty na konci (None = bez spolahlivej paticky -> rezeme po max_size)
-# max_size      : horna hranica velkosti (ochrana proti nekonecnemu rastu)
-# min_size      : mensie vysledky zahodime (najskor falosny nalez)
-# header_offset : o kolko bajtov pred najdenym vzorom realne zacina subor
-#                 (napr. MP4 ma 'ftyp' az na 5. bajte)
+# --- file-type definitions ---------------------------------------------------
+# header        : bytes at the start of the file
+# footer        : bytes at the end (None = no reliable footer -> cut at max_size)
+# max_size      : upper size limit (guards against unbounded growth)
+# min_size      : smaller results are discarded (likely false positives)
+# header_offset : how many bytes before the matched pattern the file really
+#                 starts (e.g. MP4 has 'ftyp' at byte 5)
 
 class FileType:
     def __init__(self, name, ext, header, footer=None,
                  max_size=50 * 1024 * 1024, min_size=1024, header_offset=0,
-                 footer_pad=0, category="ine", validate=None, trim=None):
+                 footer_pad=0, category="other", validate=None, trim=None):
         self.name = name
         self.ext = ext
         self.header = header
@@ -54,14 +55,14 @@ class FileType:
         self.max_size = max_size
         self.min_size = min_size
         self.header_offset = header_offset
-        self.footer_pad = footer_pad  # kolko bajtov za paticku este pribalit
-        self.category = category      # fotky/videa/dokumenty/archivy/hudba/exe/databazy
-        self.validate = validate      # volitelna funkcia (cesta)->bool po dorezani
-        self.trim = trim              # volitelna funkcia (cesta)->int presna dlzka
+        self.footer_pad = footer_pad  # extra bytes to include after the footer
+        self.category = category      # photos/videos/documents/archives/music/exe/databases
+        self.validate = validate      # optional (path)->bool after trimming
+        self.trim = trim              # optional (path)->int exact length
 
 
 def _pe_validate(path):
-    """Overi, ci MZ subor je naozaj Windows PE (exe/dll) — znizi falosne nalezy."""
+    """Confirm an MZ file is a real Windows PE (exe/dll) — cuts false matches."""
     try:
         with open(path, "rb") as f:
             head = f.read(4096)
@@ -82,7 +83,7 @@ def _be(b, o, n):
 
 
 def trim_pe(path):
-    """Vrati presnu dlzku PE suboru (exe/dll) z tabulky sekcii, alebo None."""
+    """Return the exact length of a PE file (exe/dll) from its section table."""
     try:
         with open(path, "rb") as f:
             b = f.read(2 * 1024 * 1024)
@@ -101,10 +102,10 @@ def trim_pe(path):
             raw_ptr = _le(b, e + 20, 4)
             if raw_ptr and raw_size:
                 end = max(end, raw_ptr + raw_size)
-        # tabulka certifikatov (digitalny podpis) je pripojena na konci
-        # data directory #4 (Security) je v optional header
+        # the certificate table (digital signature) is appended at the end;
+        # data directory #4 (Security) lives in the optional header
         magic = _le(b, pe + 24, 2)
-        dd = pe + 24 + (112 if magic == 0x20b else 96)   # offset data directories
+        dd = pe + 24 + (112 if magic == 0x20b else 96)   # data directories offset
         cert_off = _le(b, dd + 4 * 8, 4)
         cert_size = _le(b, dd + 4 * 8 + 4, 4)
         if cert_off and cert_size:
@@ -115,7 +116,7 @@ def trim_pe(path):
 
 
 def trim_mp4(path):
-    """Vrati presnu dlzku MP4/MOV suboru pospajanim top-level boxov, alebo None."""
+    """Return the exact length of an MP4/MOV file by walking top-level boxes."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
@@ -133,10 +134,10 @@ def trim_mp4(path):
                 if first and btype != b"ftyp":
                     return None
                 first = False
-                if bsize == 1:            # 64-bit velkost
+                if bsize == 1:            # 64-bit size
                     ext = f.read(8)
                     bsize = _be(ext, 0, 8)
-                elif bsize == 0:          # box po koniec suboru
+                elif bsize == 0:          # box extends to end of file
                     return size
                 if bsize < 8:
                     break
@@ -146,61 +147,62 @@ def trim_mp4(path):
         return None
 
 
-# Zakladna sada — typy s jasnou hlavickou aj patickou (malo falosnych nalezov)
+# Base set — types with a clear header AND footer (few false positives)
 BASE_TYPES = [
     FileType("jpeg", "jpg", b"\xFF\xD8\xFF", b"\xFF\xD9",
-             max_size=30 * 1024 * 1024, min_size=4 * 1024, category="fotky"),
+             max_size=30 * 1024 * 1024, min_size=4 * 1024, category="photos"),
     FileType("png", "png", b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82",
-             max_size=60 * 1024 * 1024, min_size=100, category="fotky"),
+             max_size=60 * 1024 * 1024, min_size=100, category="photos"),
     FileType("gif", "gif", b"GIF8", b"\x00\x3B",
-             max_size=20 * 1024 * 1024, min_size=256, category="fotky"),
+             max_size=20 * 1024 * 1024, min_size=256, category="photos"),
     FileType("pdf", "pdf", b"%PDF-", b"%%EOF",
              max_size=200 * 1024 * 1024, min_size=1024, footer_pad=2,
-             category="dokumenty"),
-    # ZIP pokryva aj docx / xlsx / pptx / odt / apk / jar
+             category="documents"),
+    # ZIP also covers docx / xlsx / pptx / odt / apk / jar
     FileType("zip", "zip", b"PK\x03\x04", b"PK\x05\x06",
              max_size=500 * 1024 * 1024, min_size=256, footer_pad=18,
-             category="dokumenty"),
+             category="documents"),
 ]
 
-# Rozsirena sada (--all) — viac typov, ale aj viac falosnych nalezov
+# Extended set (--all) — more types, but also more false positives
 EXTRA_TYPES = [
     FileType("mp4", "mp4", b"ftyp", None, header_offset=4,
-             max_size=512 * 1024 * 1024, min_size=64 * 1024, category="videa",
+             max_size=512 * 1024 * 1024, min_size=64 * 1024, category="videos",
              trim=trim_mp4),
     FileType("mp3", "mp3", b"ID3", None,
-             max_size=30 * 1024 * 1024, min_size=16 * 1024, category="hudba"),
+             max_size=30 * 1024 * 1024, min_size=16 * 1024, category="music"),
     FileType("gzip", "gz", b"\x1f\x8b\x08", None,
-             max_size=100 * 1024 * 1024, min_size=256, category="archivy"),
+             max_size=100 * 1024 * 1024, min_size=256, category="archives"),
     FileType("rar", "rar", b"Rar!\x1a\x07", None,
-             max_size=500 * 1024 * 1024, min_size=1024, category="archivy"),
+             max_size=500 * 1024 * 1024, min_size=1024, category="archives"),
     FileType("7z", "7z", b"7z\xbc\xaf\x27\x1c", None,
-             max_size=500 * 1024 * 1024, min_size=1024, category="archivy"),
+             max_size=500 * 1024 * 1024, min_size=1024, category="archives"),
     FileType("sqlite", "sqlite", b"SQLite format 3\x00", None,
-             max_size=100 * 1024 * 1024, min_size=512, category="databazy"),
+             max_size=100 * 1024 * 1024, min_size=512, category="databases"),
     FileType("doc_ole", "doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", None,
-             max_size=100 * 1024 * 1024, min_size=4 * 1024, category="dokumenty"),
+             max_size=100 * 1024 * 1024, min_size=4 * 1024, category="documents"),
     FileType("wav", "wav", b"RIFF", None, header_offset=0,
-             max_size=200 * 1024 * 1024, min_size=4 * 1024, category="hudba"),
-    # Spustitelne subory (Windows PE: exe/dll). 'MZ' je caste -> overujeme PE hlavickou.
+             max_size=200 * 1024 * 1024, min_size=4 * 1024, category="music"),
+    # Executables (Windows PE: exe/dll). 'MZ' is common -> verified via PE header.
     FileType("exe", "exe", b"MZ", None,
              max_size=128 * 1024 * 1024, min_size=4 * 1024, category="exe",
              validate=_pe_validate, trim=trim_pe),
 ]
 
-BLOCK = 4 * 1024 * 1024       # citame po 4 MB (nasobok sektora -> OK aj na Windows)
-SECTOR = 4096                 # zarovnanie pre surove citanie
+BLOCK = 4 * 1024 * 1024       # read in 4 MB chunks (sector multiple -> OK on Windows)
+SECTOR = 4096                 # alignment for raw reads
 
 
-# --- pomocne funkcie ---------------------------------------------------------
+# --- helpers -----------------------------------------------------------------
 
 def list_disks():
-    """Vypise dostupne disky / oddiely podla operacneho systemu."""
+    """Print available disks / partitions for the current OS."""
     sysname = platform.system()
-    print("=== Dostupne disky ===\n")
+    print("=== Available disks ===\n")
     if sysname == "Windows":
-        print("Fyzicke disky pouzivaj ako:  \\\\.\\PhysicalDrive0, \\\\.\\PhysicalDrive1, ...")
-        print("Oddiely (pismena) ako:       \\\\.\\C:  \\\\.\\E:  ...\n")
+        print(r"Physical disks: use \\.\PhysicalDrive0, \\.\PhysicalDrive1, ...")
+        print(r"Partitions (letters): use \\.\C:  \\.\E:  ...")
+        print()
         try:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
@@ -209,9 +211,9 @@ def list_disks():
                 capture_output=True, text=True, timeout=30)
             print(out.stdout or out.stderr)
         except Exception as e:
-            print("(Get-Disk zlyhal: %s)" % e)
+            print("(Get-Disk failed: %s)" % e)
     else:  # Linux / macOS
-        print("Zariadenia pouzivaj ako:  /dev/sdb, /dev/sdb1, /dev/nvme0n1, ...\n")
+        print("Devices: use /dev/sdb, /dev/sdb1, /dev/nvme0n1, ...\n")
         if os.path.exists("/proc/partitions"):
             print(open("/proc/partitions").read())
         else:
@@ -220,17 +222,17 @@ def list_disks():
                                      capture_output=True, text=True, timeout=30)
                 print(out.stdout or out.stderr)
             except Exception as e:
-                print("(nepodarilo sa zistit zariadenia: %s)" % e)
+                print("(could not list devices: %s)" % e)
 
 
 def open_source(path):
-    """Otvori zdroj len na citanie. Vrati file objekt."""
-    # 'rb' funguje pre image subory aj surove zariadenia (\\.\PhysicalDriveN aj /dev/sdX)
+    """Open the source read-only. Returns a file object."""
+    # 'rb' works for image files and raw devices (\\.\PhysicalDriveN and /dev/sdX)
     return open(path, "rb", buffering=0)
 
 
 def source_size(path, fh):
-    """Pokusi sa zistit celkovu velkost zdroja (pre percenta). Moze vratit None."""
+    """Try to determine the total source size (for percentages). May return None."""
     try:
         if os.path.isfile(path):
             return os.path.getsize(path)
@@ -255,10 +257,10 @@ def human(n):
     return "%.1f PB" % n
 
 
-# --- jadro: streamovaci carver ----------------------------------------------
+# --- core: streaming carver --------------------------------------------------
 
 class Carve:
-    """Jeden rozpracovany (otvoreny) subor, do ktoreho prudovo zapisujeme."""
+    """One in-progress (open) file that we stream bytes into."""
     __slots__ = ("ft", "path", "fh", "size", "tail")
 
     def __init__(self, ft, path):
@@ -266,11 +268,11 @@ class Carve:
         self.path = path
         self.fh = open(path, "wb")
         self.size = 0
-        self.tail = b""   # posledne bajty (kvoli hladaniu paticky cez hranicu blokov)
+        self.tail = b""   # trailing bytes (to find a footer across block boundaries)
 
 
 def list_sources():
-    """Vrati zoznam (popis, cesta) dostupnych diskov/oddielov pre GUI."""
+    """Return a list of (label, path) of available disks/partitions for the GUI."""
     items = []
     if platform.system() == "Windows":
         try:
@@ -304,7 +306,7 @@ def list_sources():
                         gb = int(size) / (1024 ** 3)
                     except ValueError:
                         gb = 0
-                    items.append(("Oddiel %s: %s (%.0f GB)" % (letter, label.strip(), gb),
+                    items.append(("Partition %s: %s (%.0f GB)" % (letter, label.strip(), gb),
                                   r"\\.\%s:" % letter))
         except Exception:
             pass
@@ -351,17 +353,17 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
 
     max_header = max(len(t.header) + t.header_offset for t in types)
     carry = b""
-    pos = 0                      # absolutny offset zaciatku 'data' v zdroji
+    pos = 0                      # absolute offset of the start of 'data' in source
     state = {"counter": 0, "recovered": 0}
-    stats = {}                   # typ -> pocet
-    active = []                  # zoznam otvorenych Carve
+    stats = {}                   # ext -> count
+    active = []                  # list of open Carve objects
 
     def commit(c):
-        """Zavrie subor, overi ho a bud ulozi (s premenovaním) alebo zahodi.
-        Vracia True ak bol ulozeny."""
+        """Close the file, validate it, then save (renamed) or discard it.
+        Returns True if it was saved."""
         c.fh.close()
         ft = c.ft
-        # orez na presnu dlzku (mp4/exe), ak to typ vie
+        # trim to the exact length (mp4/exe) if the type supports it
         if ft.trim:
             real = _safe_call(ft.trim, c.path)
             if isinstance(real, int) and 0 < real < c.size:
@@ -382,7 +384,7 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
         state["counter"] += 1
         state["recovered"] += 1
         stats[ft.ext] = stats.get(ft.ext, 0) + 1
-        final = os.path.join(out_dir, "obnovene_%06d.%s" % (state["counter"], ft.ext))
+        final = os.path.join(out_dir, "recovered_%06d.%s" % (state["counter"], ft.ext))
         try:
             os.replace(c.path, final)
         except OSError:
@@ -401,26 +403,26 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
         except OSError:
             pass
 
-    _log(log_cb, "Citam zdroj: %s" % src_path)
+    _log(log_cb, "Reading source: %s" % src_path)
     if total:
-        _log(log_cb, "Velkost zdroja: %s" % human(total))
-    _log(log_cb, "Vystup: %s" % os.path.abspath(out_dir))
-    _log(log_cb, "Typy: %s" % ", ".join(t.ext for t in types))
+        _log(log_cb, "Source size: %s" % human(total))
+    _log(log_cb, "Output: %s" % os.path.abspath(out_dir))
+    _log(log_cb, "Types: %s" % ", ".join(t.ext for t in types))
 
     while True:
         if should_stop and should_stop():
-            _log(log_cb, "Zastavene pouzivatelom.")
+            _log(log_cb, "Stopped by user.")
             break
         try:
             data = fh.read(BLOCK)
         except OSError as e:
-            # niektore surove disky hadzu chybu az na konci — berieme ako koniec
-            _log(log_cb, "(citanie skoncilo: %s)" % e)
+            # some raw devices throw an error at the very end — treat as EOF
+            _log(log_cb, "(read ended: %s)" % e)
             break
         if not data:
             break
 
-        # --- A) nakrmime uz otvorene subory novymi datami, hladame paticku ---
+        # --- A) feed already-open files with new data, look for the footer ---
         still = []
         for c in active:
             ft = c.ft
@@ -433,17 +435,17 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
                     c.fh.write(data[:end_in_data])
                     c.size += end_in_data
                     commit(c)
-                    continue  # subor dokonceny, nepridavame do 'still'
+                    continue  # file finished, not added back to 'still'
                 else:
                     c.fh.write(data)
                     c.size += len(data)
                     if c.size > ft.max_size:
-                        discard(c)  # prerastol -> zahodime
+                        discard(c)  # grew too large -> discard
                         continue
                     c.tail = (c.tail + data)[-(len(ft.footer) + ft.footer_pad):]
                     still.append(c)
             else:
-                # bez paticky: rezeme po max_size
+                # no footer: cut at max_size
                 c.fh.write(data)
                 c.size += len(data)
                 if c.size >= ft.max_size:
@@ -452,7 +454,7 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
                 still.append(c)
         active = still
 
-        # --- B) hladame nove hlavicky v buf (carry + data) ---
+        # --- B) look for new headers in buf (carry + data) ---
         buf = carry + data
         buf_start = pos - len(carry)
         for ft in types:
@@ -465,14 +467,14 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
                     break
                 start = j + 1
                 jabs = buf_start + j
-                # dedup cez hranicu: ber len hlavicky, ktore neboli cele uz
-                # v predchadzajucom bloku
+                # dedup across the boundary: only take headers that were not
+                # already fully present in the previous block
                 if jabs + len(ft.header) <= pos:
                     continue
                 hdr_abs = jabs - ft.header_offset
                 if hdr_abs < 0:
                     continue
-                # zaciatok suboru v ramci buf
+                # start of the file within buf
                 s = hdr_abs - buf_start
                 if s < 0:
                     continue
@@ -485,7 +487,7 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
                 except OSError:
                     continue
                 piece = buf[s:]
-                # hned skus paticku v tomto kuse
+                # try to find the footer right away in this chunk
                 if ft.footer:
                     fidx = piece.find(ft.footer, len(ft.header))
                     if fidx != -1:
@@ -513,30 +515,30 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
         elif not quiet:
             if total:
                 pct = 100.0 * pos / total
-                sys.stdout.write("\rSpracovane: %s / %s (%.1f %%)  obnovene: %d   "
+                sys.stdout.write("\rProcessed: %s / %s (%.1f %%)  recovered: %d   "
                                  % (human(pos), human(total), pct, state["recovered"]))
             else:
-                sys.stdout.write("\rSpracovane: %s   obnovene: %d   "
+                sys.stdout.write("\rProcessed: %s   recovered: %d   "
                                  % (human(pos), state["recovered"]))
             sys.stdout.flush()
 
         if max_files and state["recovered"] >= max_files:
-            _log(log_cb, "Dosiahnuty limit %d suborov — koncim." % max_files)
+            _log(log_cb, "Reached limit of %d files — stopping." % max_files)
             break
 
-    # koniec zdroja — dokoncime este otvorene subory bez paticky / bez konca
+    # end of source — finalize files still open (footer-less / no end found)
     for c in active:
         commit(c)
 
     fh.close()
     _log(log_cb, "")
-    _log(log_cb, "=== HOTOVO ===")
-    _log(log_cb, "Obnovenych suborov: %d" % state["recovered"])
+    _log(log_cb, "=== DONE ===")
+    _log(log_cb, "Recovered files: %d" % state["recovered"])
     for ext, n in sorted(stats.items()):
         _log(log_cb, "   %-6s %d" % (ext, n))
-    _log(log_cb, "Najdes ich v: %s" % os.path.abspath(out_dir))
-    _log(log_cb, "Pozn.: carving nevie obnovit povodne nazvy suborov a niektore "
-                 "nalezy mozu byt falosne alebo neuplne.")
+    _log(log_cb, "Find them in: %s" % os.path.abspath(out_dir))
+    _log(log_cb, "Note: carving cannot recover original file names and some hits "
+                 "may be false or incomplete.")
     return {"recovered": state["recovered"], "stats": stats,
             "out_dir": os.path.abspath(out_dir)}
 
@@ -545,21 +547,21 @@ def run_carver(src_path, out_dir, types, max_open=300, quiet=False,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Obnova vymazanych suborov z disku / USB / image (file carving).")
+        description="Recover deleted files from a disk / USB / image (file carving).")
     ap.add_argument("source", nargs="?",
-                    help="zdroj: zariadenie (/dev/sdb, \\\\.\\PhysicalDrive1, \\\\.\\E:) "
-                         "alebo image subor (disk.img)")
-    ap.add_argument("-o", "--output", default="obnovene",
-                    help="priecinok pre obnovene subory (MUSI byt na inom disku!)")
+                    help="source: device (/dev/sdb, \\\\.\\PhysicalDrive1, \\\\.\\E:) "
+                         "or an image file (disk.img)")
+    ap.add_argument("-o", "--output", default="recovered",
+                    help="directory for recovered files (MUST be on another drive!)")
     ap.add_argument("--list", action="store_true",
-                    help="vypis dostupne disky a skonci")
+                    help="list available disks and exit")
     ap.add_argument("--all", action="store_true",
-                    help="zapni aj rozsirene typy (mp4, mp3, zip archivy, sqlite, ...)")
+                    help="also enable extended types (mp4, mp3, archives, sqlite, exe, ...)")
     ap.add_argument("--only", default=None,
-                    help="iba vybrane pripony oddelene ciarkou, napr. jpg,png,pdf")
+                    help="only the given extensions, comma-separated, e.g. jpg,png,pdf")
     ap.add_argument("--max-open", type=int, default=300,
-                    help="max. pocet sucasne rozpracovanych suborov (default 300)")
-    ap.add_argument("-q", "--quiet", action="store_true", help="bez priebeznych vypisov")
+                    help="max simultaneously open carves (default 300)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="no progress output")
     args = ap.parse_args()
 
     if args.list:
@@ -577,18 +579,18 @@ def main():
         wanted = {x.strip().lower() for x in args.only.split(",")}
         types = [t for t in (BASE_TYPES + EXTRA_TYPES) if t.ext in wanted]
         if not types:
-            print("Ziadny zo zadanych typov nepoznam. Dostupne: %s"
+            print("None of the given types is known. Available: %s"
                   % ", ".join(sorted({t.ext for t in BASE_TYPES + EXTRA_TYPES})))
             return 1
 
-    # bezpecnostna kontrola: vystup nesmie byt na zdroji
+    # safety check: output must not be on the source
     try:
         if os.path.isfile(args.source):
             src_abs = os.path.abspath(args.source)
             out_abs = os.path.abspath(args.output)
             if out_abs.startswith(os.path.dirname(src_abs)):
-                print("VAROVANIE: vystupny priecinok je pri zdrojovom image. "
-                      "Odporucam iny disk.")
+                print("WARNING: output directory is next to the source image. "
+                      "A different drive is recommended.")
     except OSError:
         pass
 
@@ -596,11 +598,11 @@ def main():
         run_carver(args.source, args.output, types,
                    max_open=args.max_open, quiet=args.quiet)
     except PermissionError:
-        print("\nCHYBA: nedostatocne opravnenia na citanie zdroja.")
-        print("Linux: spusti cez 'sudo'.  Windows: spusti terminal ako Administrator.")
+        print("\nERROR: insufficient privileges to read the source.")
+        print("Linux: run with 'sudo'.  Windows: run the terminal as Administrator.")
         return 2
     except FileNotFoundError:
-        print("\nCHYBA: zdroj '%s' sa nenasiel. Skontroluj nazov (pozri --list)."
+        print("\nERROR: source '%s' not found. Check the name (see --list)."
               % args.source)
         return 2
     return 0
